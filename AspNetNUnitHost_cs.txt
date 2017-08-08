@@ -1,0 +1,160 @@
+//File:    AspNetNUnitHost.cs
+//Author:  Steve Maine
+//Email:   stevem@hyperthink.net
+
+
+// This was compiled and tested against ASP.NET 1.0. I make no assertions or guarantees that this
+// will work on any other version of the framework, since there's a lot of wierd stuff going on...
+
+using System;
+using System.Diagnostics;
+using System.Web;
+using System.Web.Hosting;
+using System.Web.UI;
+
+namespace Maine.Steve.UnitTests
+{
+	//This is a simple MarshalByRef wrapper for the returned control.
+	//Necessary because the control will be instantiated in a different AppDomain
+	//than the test code, and TemplateControl is not MarshalByRef.
+	public class TemplateControlWrapper : MarshalByRefObject
+	{
+		public System.Web.UI.TemplateControl Control;
+
+		public TemplateControlWrapper(System.Web.UI.TemplateControl control)
+		{
+			Control = control;
+		}
+	}
+
+	//Host the ASP.NET runtime outside of IIS.
+	[Serializable]
+	public class AspNetNUnitHost : MarshalByRefObject, IDisposable
+	{
+		//The virtual directory name of the web app.
+		public string               _virDir;
+
+		//The physical directory to which that VRoot maps
+		public string               _physicalDir;
+
+		//Where the output goes
+		public System.IO.TextWriter _outputWriter;
+
+		//The physical path to the aspnet_isapi DLL 
+		public static string        ASPNET_ISAPI_PATH = @"c:\windows\Microsoft.NET\Framework\v1.0.3705\aspnet_isapi.dll";
+
+		//Has the HttpRuntime already been initialized?
+		public static bool RUNTIME_INITIALIZED = false;
+
+		private TextWriterTraceListener consoleListener;
+		private static long hModule;
+
+		//PInvoke decl for LoadLibrary
+		[System.Runtime.InteropServices.DllImport("KERNEL32.DLL", EntryPoint = "LoadLibraryEx")]
+		public static extern long LoadLibrary(string fileName, long hFile, long dwFlags);
+
+		//PInvoke decl for FreeLibrary
+		[System.Runtime.InteropServices.DllImport("KERNEL32.DLL", EntryPoint="FreeLibrary")]
+		public static extern bool FreeLibrary( long hModule );
+
+		//Creates a host that can serve pages from a particular VRoot
+		public static AspNetNUnitHost CreateAspNetNunitHost(string virDir, string physicalDir, System.IO.TextWriter writer)
+		{
+			//Load up aspnet_isapi, because some of the code that initializes the HttpRuntim
+			//depends on functions defined in this library.
+			hModule = LoadLibrary(ASPNET_ISAPI_PATH, 0, 0);
+
+			//Create an ASP.NET Application Host
+			AspNetNUnitHost host = (AspNetNUnitHost) ApplicationHost.CreateApplicationHost(typeof(AspNetNUnitHost), virDir, physicalDir);
+           
+			host._physicalDir  = physicalDir;
+			host._virDir       = virDir;
+			host._outputWriter = writer;
+
+			return host;
+		}
+
+		public AspNetNUnitHost()
+		{
+		}
+                        
+		//Fakes an incoming page request (i.e. "foo.aspx")
+		public void ProcessRequest(string page)
+		{
+			HttpRuntime.ProcessRequest(new SimpleWorkerRequest(page, null, this._outputWriter));
+		}
+
+		//Returns a compiled instance of the ASP.NET Page object.
+		//The returned instance is wrapped in an AspNetControlWrapper, after which
+		//the page can be accessed just like any other object.
+		public TemplateControlWrapper GetCompiledPageInstance(string page)
+		{
+			object o = null;
+
+			try
+			{
+				SimpleWorkerRequest request = new SimpleWorkerRequest(page, null, _outputWriter);
+				HttpContext context = new HttpContext(request);
+
+				//The HttpRuntime does not have any initialization functions -- everything happens
+				//during the servicing of the first request.
+				if(AspNetNUnitHost.RUNTIME_INITIALIZED)
+				{
+					//This call has the side effect of initializing the HTTP runtime
+					HttpRuntime.ProcessRequest(request);
+					AspNetNUnitHost.RUNTIME_INITIALIZED = true;
+				}
+                
+				//Drop an HttpContext instance onto the message, so that subsequent calls to 
+				//the static HttpContext.Current will return a context
+				System.Runtime.Remoting.Messaging.CallContext.SetData("HttpContext", context);
+				
+				//Get the compiled page instance
+				o = PageParser.GetCompiledPageInstance(_virDir + "/" + page, _physicalDir + "\\" + page, context);
+                
+				//This has the side effect of intializing the Page object
+				//(instantiating all its controls and populating the Controls collection, for example)
+				((IHttpHandler)o).ProcessRequest(context);    
+
+			}
+			catch(Exception e)
+			{
+				Debug.WriteLine(e.GetType().ToString());
+				Debug.WriteLine(e.Message);
+                
+				Debug.WriteLine(e.StackTrace);
+			}
+
+			//Wrap the control in a MarshalByRef so it can marshal back to the AppDomain
+			//of the caller.
+			return new TemplateControlWrapper((TemplateControl) o);
+		}
+
+		#region IDisposable Members
+
+		public void Dispose()
+		{
+			Dispose( false );
+		}
+		
+	    ~AspNetNUnitHost()
+		{
+			Dispose( true );
+		}
+
+		private void Dispose( bool bFinalizing )
+		{
+			if( !bFinalizing )
+				GC.SuppressFinalize( this );
+
+			//Free the aspnet_isapi .dll
+			FreeLibrary( AspNetNUnitHost.hModule );
+		}
+
+		#endregion
+	}
+
+	//Example of usage in a unit test:
+	//AspNetNunitHost host = AspNetNunitHost.CreateAspNetNunitHost("/foo", @"c:\inetpub\wwwroot\foo", Console.Out);
+	//AspNetControlWrapper o = host.GetCompiledPageInstance("MyPage.aspx");
+}
