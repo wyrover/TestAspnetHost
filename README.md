@@ -1,0 +1,2 @@
+# TestAspnetHost
+ApplicationHost SimpleWorkerRequest
